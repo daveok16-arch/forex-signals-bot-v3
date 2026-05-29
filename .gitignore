@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Virtual env
+venv/
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Outputs
+output/
+reports/
+artifacts/
+
+# Models
+models/
+*.pt
+*.pth
+*.pkl
+*.joblib
+*.onnx
+
+# Data
+data/
+datasets/
+*.csv
+*.parquet
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kaggle
+kaggle.json
+
+# IDE
+.vscode/
+.idea/
