@@ -114,14 +114,15 @@ class ModelTrainingEngine(BaseAgent):
         model_dir = self._save_models()
         results["model_paths"] = model_dir
         
+        results["ensemble_ready"] = len(results["models_trained"]) > 0
+        results["total_models"] = len(results["models_trained"])
+        results["device_used"] = self.device
+
         # Step 4: Generate training report
         self.logger.info("STEP 4: Generating training report")
         report_path = self._generate_training_report(results)
         results["report_path"] = report_path
         
-        results["ensemble_ready"] = len(results["models_trained"]) > 0
-        results["total_models"] = len(results["models_trained"])
-        results["device_used"] = self.device
         
         self.logger.info(
             f"\nAgent B complete | Models: {results['total_models']} | "
@@ -364,7 +365,8 @@ class ModelTrainingEngine(BaseAgent):
                 }
                 
                 cv_scores = []
-                cv = self._create_cv_splitter()
+                # Time-ordered folds so the purge gap removes leakage between adjacent train/val obs
+                cv = TimeSeriesSplit(n_splits=self.opt_config.get("cv_folds", 5))
                 
                 for train_idx, val_idx in cv.split(X, y):
                     # Apply purge gap

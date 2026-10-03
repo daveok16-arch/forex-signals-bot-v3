@@ -498,9 +498,13 @@ class SignalGenerationEngine(BaseAgent):
             else:
                 trend = "mixed"
         
+        # Feature parquet is saved without an index, so the candle timestamp may
+        # not be a datetime - fall back to the current time in that case.
+        ts = timestamp if hasattr(timestamp, "isoformat") else pd.Timestamp.utcnow()
+
         signal = {
             "pair": pair,
-            "timestamp": timestamp.isoformat(),
+            "timestamp": ts.isoformat(),
             "generated_at": datetime.utcnow().isoformat(),
             "current_price": round(float(current_price), 5),
             "direction": direction,
