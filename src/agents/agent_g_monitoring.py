@@ -310,81 +310,71 @@ class MonitoringCloudSyncEngine(BaseAgent):
         return backup_prefix
 
     def _sync_to_github(self, artifacts: List[Path]) -> bool:
-        """Sync important artifacts to GitHub repository"""
-        if not self.github_config.get("auto_commit", True):
+        """Sync important artifacts to the configured git remote.
+
+        Committing is opt-in (``github.auto_commit: true``) so a monitoring run
+        never mutates the working tree unexpectedly. Returns True only when a
+        commit was actually created and pushed.
+        """
+        if not self.github_config.get("auto_commit", False):
+            self.logger.info("GitHub auto_commit disabled - skipping sync")
             return False
-        
+
         repo = self.github_config.get("repo", "")
-        if not repo:
+        if not repo or repo.startswith("${"):
             self.logger.info("GitHub repo not configured - skipping sync")
             return False
-        
+
         try:
-            # Check if git is available
-            result = subprocess.run(
-                ["git", "--version"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode != 0:
+            if subprocess.run(["git", "--version"], capture_output=True, text=True,
+                              timeout=10).returncode != 0:
                 self.logger.info("Git not available - skipping GitHub sync")
                 return False
-            
-            # Check if we're in a git repo
-            git_dir = self.project_root / ".git"
-            if not git_dir.exists():
-                self.logger.info("Not a git repository - initializing")
-                subprocess.run(["git", "init"], cwd=self.project_root, capture_output=True)
-                subprocess.run(
-                    ["git", "remote", "add", "origin", f"https://github.com/{repo}.git"],
-                    cwd=self.project_root,
-                    capture_output=True
-                )
-            
-            # Stage important files
-            important_patterns = [
-                "config/*.yaml",
-                "src/**/*.py",
-                "docs/*.md",
-                "notebooks/*.ipynb"
-            ]
-            
+
+            if not (self.project_root / ".git").exists():
+                self.logger.warning("Not a git repository - skipping GitHub sync")
+                return False
+
+            important_patterns = ["config/*.yaml", "src/**/*.py", "docs/*.md",
+                                  "notebooks/*.ipynb"]
             for pattern in important_patterns:
                 for file in self.project_root.glob(pattern):
                     if file.is_file():
-                        subprocess.run(
-                            ["git", "add", str(file.relative_to(self.project_root))],
-                            cwd=self.project_root,
-                            capture_output=True
-                        )
-            
-            # Commit
+                        subprocess.run(["git", "add", str(file.relative_to(self.project_root))],
+                                       cwd=self.project_root, capture_output=True)
+
+            diff = subprocess.run(["git", "diff", "--cached", "--quiet"],
+                                  cwd=self.project_root, capture_output=True)
+            if diff.returncode == 0:
+                self.logger.info("No changes to commit - skipping GitHub sync")
+                return False
+
             commit_msg = self.github_config.get(
-                "commit_message_template",
-                "[BOT] {timestamp} - {event}"
-            ).format(
-                timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                event="sync"
-            )
-            
-            result = subprocess.run(
-                ["git", "commit", "-m", commit_msg],
-                cwd=self.project_root,
-                capture_output=True,
-                text=True
-            )
-            
-            # Push (may fail if no credentials - that's ok for now)
-            subprocess.run(
-                ["git", "push", "origin", self.github_config.get("branch", "main"), "--quiet"],
-                cwd=self.project_root,
-                capture_output=True
-            )
-            
+                "commit_message_template", "[BOT] {timestamp} - {event}"
+            ).format(timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), event="sync")
+
+            commit = subprocess.run(["git", "commit", "-m", commit_msg],
+                                    cwd=self.project_root, capture_output=True, text=True)
+            if commit.returncode != 0:
+                self.logger.warning(f"git commit failed: {commit.stderr.strip()[:200]}")
+                return False
+
+            remotes = subprocess.run(["git", "remote"], cwd=self.project_root,
+                                     capture_output=True, text=True).stdout.split()
+            if "origin" not in remotes:
+                self.logger.info("No origin remote - commit created locally only")
+                return False
+
+            push = subprocess.run(["git", "push", "origin",
+                                   self.github_config.get("branch", "main")],
+                                  cwd=self.project_root, capture_output=True, text=True)
+            if push.returncode != 0:
+                self.logger.warning(f"git push failed: {push.stderr.strip()[:200]}")
+                return False
+
             self.logger.info("GitHub sync completed")
             return True
-            
+
         except Exception as e:
             self.logger.warning(f"GitHub sync failed (expected if not configured): {e}")
             return False

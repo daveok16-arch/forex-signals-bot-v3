@@ -269,7 +269,7 @@ class RiskManagementEngine(BaseAgent):
         direction = signal.get("direction", "HOLD")
         
         # Get ATR for volatility-based sizing
-        atr = signal.get("market_context", {}).get("atr_14", 0.001)
+        atr = signal.get("market_context", {}).get("atr_14") or 0.001
         current_price = signal.get("current_price", 1.0)
         
         # Account for pair-specific pip value
@@ -350,7 +350,7 @@ class RiskManagementEngine(BaseAgent):
         pair = signal["pair"]
         direction = signal["direction"]
         price = signal["current_price"]
-        atr = signal.get("market_context", {}).get("atr_14", price * 0.001)
+        atr = signal.get("market_context", {}).get("atr_14") or price * 0.001
         
         # Stop Loss calculation
         sl_method = self.sl_config.get("method", "atr_based")

@@ -39,7 +39,9 @@ class PipelineOrchestrator:
     def __init__(self, config_path: str = "config/system_config.yaml", kaggle_mode: bool = False):
         self.config_path = config_path
         self.kaggle_mode = kaggle_mode
-        self.project_root = Path(__file__).parent.parent
+        # Match base_agent._get_project_root (repo root, not src/) so pipeline
+        # state and dependency artifact paths resolve to the same tree agents write to.
+        self.project_root = Path(__file__).resolve().parent.parent.parent
         
         # Pipeline state
         self._pipeline_state: Dict[str, Any] = {
@@ -93,6 +95,19 @@ class PipelineOrchestrator:
         self._agents["agent_g"] = MonitoringCloudSyncEngine
         self._agent_dependencies["agent_g"] = []  # Always runs
 
+        # A dependency is satisfied either by running earlier in this pipeline or
+        # by its output already existing on disk. The latter lets the inference
+        # pipeline (A, C, D, F, G) reuse models/features produced by a prior
+        # training run instead of skipping C/D/F because B is not in the list.
+        self._agent_artifacts: Dict[str, str] = {
+            "agent_a": "output/agent_a/features/*_features.parquet",
+            "agent_b": "output/agent_b/*_scaler.pkl",
+            "agent_c": "output/agent_c/signals_*.json",
+            "agent_d": "output/agent_d/risk_state.json",
+            "agent_e": "output/agent_e/backtest_report_*.json",
+            "agent_f": "output/agent_f/execution_state.json",
+        }
+
     def _can_run(self, agent_name: str) -> bool:
         """Check if agent can run based on dependencies"""
         dependencies = self._agent_dependencies.get(agent_name, [])
@@ -100,10 +115,20 @@ class PipelineOrchestrator:
         for dep in dependencies:
             if dep in self._pipeline_state["failed_agents"]:
                 return False
-            if dep not in self._pipeline_state["completed_agents"]:
-                return False
-        
+            if dep in self._pipeline_state["completed_agents"]:
+                continue
+            if self._dependency_artifacts_exist(dep):
+                continue
+            return False
+
         return True
+
+    def _dependency_artifacts_exist(self, dep: str) -> bool:
+        """True if a dependency's output artifacts already exist on disk."""
+        pattern = self._agent_artifacts.get(dep)
+        if not pattern:
+            return False
+        return any(self.project_root.glob(pattern))
 
     def _run_agent(self, agent_name: str) -> AgentResult:
         """Execute a single agent"""

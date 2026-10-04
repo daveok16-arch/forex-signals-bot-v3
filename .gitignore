@@ -45,3 +45,6 @@ kaggle.json
 # IDE
 .vscode/
 .idea/
+
+# CatBoost training output
+catboost_info/

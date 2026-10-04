@@ -332,11 +332,8 @@ class ModelTrainingEngine(BaseAgent):
         """Create cross-validation splitter with purging"""
         purge_gap = self.opt_config.get("purge_gap", 10)
         
-        if self.opt_config.get("cv_method", "purged_kfold") == "time_series":
-            return TimeSeriesSplit(n_splits=n_splits)
-        else:
-            # Use stratified k-fold as base (purging applied during split)
-            return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        # Time series data must never be shuffled; use forward-chaining folds.
+        return TimeSeriesSplit(n_splits=n_splits)
 
     def _train_xgboost(self, pair: str, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
         """Train XGBoost with Optuna optimization"""
@@ -359,7 +356,6 @@ class ModelTrainingEngine(BaseAgent):
                     "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
                     "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
                     "random_state": 42,
-                    "use_label_encoder": False,
                     "eval_metric": "logloss",
                     "tree_method": "gpu_hist" if self.device == "cuda" else "hist"
                 }
@@ -408,7 +404,6 @@ class ModelTrainingEngine(BaseAgent):
             best_params = study.best_params
             best_params.update({
                 "random_state": 42,
-                "use_label_encoder": False,
                 "eval_metric": "logloss",
                 "tree_method": "gpu_hist" if self.device == "cuda" else "hist"
             })
@@ -453,7 +448,7 @@ class ModelTrainingEngine(BaseAgent):
                 }
                 
                 cv_scores = []
-                cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+                cv = TimeSeriesSplit(n_splits=3)
                 
                 for train_idx, val_idx in cv.split(X, y):
                     X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -505,7 +500,7 @@ class ModelTrainingEngine(BaseAgent):
                 }
                 
                 cv_scores = []
-                cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+                cv = TimeSeriesSplit(n_splits=3)
                 
                 for train_idx, val_idx in cv.split(X, y):
                     X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -556,7 +551,7 @@ class ModelTrainingEngine(BaseAgent):
         
         # Cross-validation
         cv_scores = []
-        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        cv = TimeSeriesSplit(n_splits=3)
         
         for train_idx, val_idx in cv.split(X, y):
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -759,7 +754,7 @@ class ModelTrainingEngine(BaseAgent):
             
             # Evaluate
             cv_scores = []
-            cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+            cv = TimeSeriesSplit(n_splits=3)
             for train_idx, val_idx in cv.split(X, y):
                 X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
                 preds = ensemble.predict(X_val)

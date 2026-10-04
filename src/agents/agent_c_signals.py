@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.base_agent import BaseAgent
 from core.kaggle_manager import KaggleManager
+from core.trend_strategy import TrendConfig, TrendStrategy
 
 
 class SignalGenerationEngine(BaseAgent):
@@ -55,6 +56,22 @@ class SignalGenerationEngine(BaseAgent):
         
         self.signal_filters = self.agent_config.get("signal_filters", {})
         self.uncertainty_config = self.agent_config.get("uncertainty_quantification", {})
+
+        # Tradeable strategy: multi-horizon trend / time-series momentum. This is
+        # the only edge that validated out-of-sample (see core/trend_strategy.py).
+        trend_cfg = self.agent_config.get("trend_strategy", {})
+        self.strategy_name = trend_cfg.get("strategy", "trend_momentum")
+        self.use_strategy = trend_cfg.get("enabled", True)
+        self.trend = TrendStrategy(TrendConfig(
+            lookbacks=trend_cfg.get("lookbacks", [63, 126, 252]),
+            vol_window=trend_cfg.get("vol_window", 60),
+            target_vol=trend_cfg.get("target_vol", 0.10),
+            max_leverage=trend_cfg.get("max_leverage", 3.0),
+            atr_stop_mult=trend_cfg.get("atr_stop_mult", 2.0),
+            reward_risk=trend_cfg.get("reward_risk", 2.0),
+            min_strength=trend_cfg.get("min_strength", 0.5),
+            horizon_days=trend_cfg.get("horizon_days", 21),
+        ))
         
         # State
         self._models: Dict[str, Any] = {}
@@ -84,7 +101,11 @@ class SignalGenerationEngine(BaseAgent):
         # Step 2: Load latest feature data
         self.logger.info("STEP 2: Loading latest features")
         feature_data = self._load_latest_features()
-        
+
+        if self.use_strategy:
+            self.logger.info(f"STEP 3: Generating {self.strategy_name} signals")
+            return self._generate_strategy_signals(feature_data, results)
+
         # Step 3: Generate predictions per pair
         self.logger.info("STEP 3: Generating predictions")
         
@@ -112,10 +133,12 @@ class SignalGenerationEngine(BaseAgent):
             # Generate signals
             latest_idx = -1
             current_price = df["close"].iloc[latest_idx]
+            candle_ts = (df["timestamp"].iloc[latest_idx]
+                         if "timestamp" in df.columns else df.index[latest_idx])
             
             signal = self._create_signal(
                 pair=pair,
-                timestamp=df.index[latest_idx],
+                timestamp=candle_ts,
                 current_price=current_price,
                 prediction=ensemble_pred[latest_idx] if len(ensemble_pred) > 0 else 0.5,
                 confidence=confidence,
@@ -125,7 +148,13 @@ class SignalGenerationEngine(BaseAgent):
             )
             
             # Apply filters
-            if self._apply_signal_filters(signal):
+            passed = self._apply_signal_filters(signal)
+            self.logger.info(
+                f"    {pair}: {signal['direction']} conf={signal['confidence']:.1f} "
+                f"unc={signal['uncertainty'].get('mean_uncertainty', 0):.3f} "
+                f"-> {'PASS' if passed else 'filtered'}"
+            )
+            if passed:
                 self._current_signals[pair] = signal
                 results["signals_generated"] += 1
                 results["signals_by_pair"][pair] = signal
@@ -212,6 +241,79 @@ class SignalGenerationEngine(BaseAgent):
                 data[pair] = df.tail(500)
         
         return data
+
+    def _generate_strategy_signals(self, feature_data: Dict[str, pd.DataFrame],
+                                   results: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate signals from the validated trend strategy.
+
+        Emits the same signal schema downstream agents (D/E/F) already consume,
+        enriched with the strategy's entry/SL/TP/size and horizon.
+        """
+        raw = self.trend.generate(feature_data)
+        if not raw:
+            raise RuntimeError("Trend strategy produced no signals (insufficient data).")
+
+        min_conf = self.min_confidence * 100
+        signals: Dict[str, Dict[str, Any]] = {}
+        for pair, s in raw.items():
+            ts = feature_data[pair]["timestamp"].iloc[-1] if "timestamp" in feature_data[pair].columns \
+                else datetime.utcnow()
+            ts = ts if hasattr(ts, "isoformat") else pd.Timestamp.utcnow()
+            action = s["direction"] != "HOLD"
+            if action and s["confidence"] < min_conf:
+                action = False
+
+            self.logger.info(
+                f"    {pair}: {s['direction']} conf={s['confidence']:.1f} "
+                f"score={s['trend_score']:+.2f} -> {'PASS' if action else 'filtered'}"
+            )
+            if not action:
+                results["filtered_signals"] += 1
+                continue
+
+            signal = {
+                "pair": pair,
+                "timestamp": ts.isoformat(),
+                "generated_at": datetime.utcnow().isoformat(),
+                "current_price": s["entry"],
+                "direction": s["direction"],
+                "strength": s["strength"],
+                "confidence": s["confidence"],
+                "prediction_probability": round(0.5 + s["trend_score"] / 2.0, 6),
+                "strategy": s["strategy"],
+                "trend_score": s["trend_score"],
+                "momentum_z": s["momentum_z"],
+                "lookback_returns": s["lookback_returns"],
+                "suggested_stop_loss": s["stop_loss"],
+                "suggested_take_profit": s["take_profit"],
+                "suggested_size": s["vol_target_size"],
+                "reward_risk": s["reward_risk"],
+                "prediction_horizon_days": s["horizon_days"],
+                "uncertainty": {"mean_uncertainty": round(1.0 - s["strength"], 4)},
+                "market_context": {
+                    "annualized_vol": s["annualized_vol"],
+                    "atr_14": s.get("atr_14"),
+                    "regime_note": s["regime_note"],
+                },
+                "model_weights": {self.strategy_name: 1.0},
+                "prediction_horizon": self.prediction_horizon,
+                "expires_at": (datetime.utcnow() + timedelta(minutes=self.signal_decay_minutes)).isoformat(),
+                "status": "active",
+            }
+            signals[pair] = signal
+            results["signals_generated"] += 1
+
+        final = self._cross_pair_analysis(signals)
+        results["signals_by_pair"] = signals
+        results["final_signals"] = list(final.values())
+
+        self.logger.info("STEP 5: Saving signals")
+        results["signals_file"] = self._save_signals(results)
+        self.logger.info(
+            f"\nAgent C complete | Signals: {results['signals_generated']} | "
+            f"Filtered: {results['filtered_signals']} | Final: {len(results['final_signals'])}"
+        )
+        return results
 
     def _get_pair_models(self, pair: str) -> Dict[str, Any]:
         """Get all trained models for a specific pair"""
@@ -367,7 +469,7 @@ class SignalGenerationEngine(BaseAgent):
         
         if len(predictions) == 1:
             pred = list(predictions.values())[0]
-            confidence = np.mean(np.abs(pred - 0.5)) * 2
+            confidence = float(np.abs(np.asarray(pred)[-1] - 0.5) * 2)
             return pred, confidence, {list(predictions.keys())[0]: 1.0}
         
         # Get or compute weights
@@ -393,13 +495,13 @@ class SignalGenerationEngine(BaseAgent):
             w = weights.get(model_type, 0)
             ensemble_pred += w * np.array(pred)
         
-        # Confidence: how far from 0.5 (uncertain) averaged across models
-        model_confidences = [np.mean(np.abs(p - 0.5)) * 2 for p in predictions.values()]
-        avg_confidence = np.mean(model_confidences)
+        # Confidence on the latest bar: distance from 0.5, averaged across models
+        latest = np.array([np.asarray(p)[-1] for p in predictions.values()])
+        model_confidences = np.abs(latest - 0.5) * 2
+        avg_confidence = float(np.mean(model_confidences))
         
         # Disagreement penalty
-        pred_array = np.array(list(predictions.values()))
-        disagreement = np.std(pred_array, axis=0).mean()
+        disagreement = float(np.std(latest))
         confidence = avg_confidence * (1 - disagreement)
         
         return ensemble_pred, float(confidence), weights
@@ -637,9 +739,10 @@ class SignalGenerationEngine(BaseAgent):
                     "strength": s["strength"],
                     "confidence": s["confidence"],
                     "price": s["current_price"],
-                    "uncertainty": s["uncertainty"]["mean_uncertainty"],
-                    "trend": s["market_context"]["trend"],
-                    "volatility": s["market_context"]["volatility_regime"]
+                    "uncertainty": s.get("uncertainty", {}).get("mean_uncertainty", 0),
+                    "trend": s.get("market_context", {}).get("trend", s.get("strategy", "")),
+                    "volatility": s.get("market_context", {}).get("volatility_regime",
+                                    s.get("market_context", {}).get("annualized_vol", ""))
                 }
                 for s in results["final_signals"]
             ])

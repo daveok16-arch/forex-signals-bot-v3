@@ -76,11 +76,14 @@ agents:
     enabled: true
     data_sources:
       - "oanda"
+      - "yahoo"
       - "kaggle"
       - "truefx"
     kaggle_datasets:
       - "yakashri/export-15-fx-currency-pairs-1m"
       - "imetomi/eur-usd-forex-pair-historical-data"
+    yahoo_range: "10y"
+    allow_synthetic: false
     lookback_days: 252
     feature_count: 200
     batch_size: 10000
@@ -225,6 +228,19 @@ agents:
       min_models_agree: 3
       correlation_threshold: 0.7
       consecutive_signal_min: 2
+    # Tradeable trend / time-series-momentum strategy (validated on 55y real FX).
+    # Disable to fall back to the ML ensemble path.
+    trend_strategy:
+      enabled: true
+      strategy: "trend_momentum"
+      lookbacks: [63, 126, 252]
+      vol_window: 60
+      target_vol: 0.10
+      max_leverage: 3.0
+      atr_stop_mult: 2.0
+      reward_risk: 2.0
+      min_strength: 0.5
+      horizon_days: 21
 
   agent_d:
     name: "RiskManagementEngine"

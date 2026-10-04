@@ -8,6 +8,7 @@ Kaggle-Adapted: Auto-detects Kaggle environment, mounts datasets,
 optimizes memory, and uses GPU-accelerated computations where available.
 """
 
+import os
 import gc
 import warnings
 from pathlib import Path
@@ -54,6 +55,7 @@ class DataIngestionEngine(BaseAgent):
         self.data_sources = self.agent_config.get("data_sources", [])
         self.kaggle_datasets = self.agent_config.get("kaggle_datasets", [])
         self.lookback_days = self.agent_config.get("lookback_days", 252)
+        self.allow_synthetic = self.agent_config.get("allow_synthetic", False)
         self._feature_store: Dict[str, pd.DataFrame] = {}
 
     def _execute_core(self) -> Dict[str, Any]:
@@ -134,34 +136,103 @@ class DataIngestionEngine(BaseAgent):
     def _load_data(self) -> Dict[str, pd.DataFrame]:
         """
         Load forex data from available sources.
-        Priority: Kaggle datasets > OANDA API > Local files > Synthetic demo
+
+        Priority:
+          1. Kaggle datasets (when in a Kaggle environment)
+          2. OANDA REST API (when OANDA_API_KEY is configured)
+          3. Local files under data/raw
+          4. Yahoo Finance (keyless, real market data)
+        Synthetic data is only produced when ``allow_synthetic`` is explicitly
+        enabled in the agent config, and a loud warning is emitted when it is.
         """
-        raw_data = {}
-        
-        # Try Kaggle datasets first (if in Kaggle environment)
+        raw_data: Dict[str, pd.DataFrame] = {}
+
         if self.kaggle_mode and self.kaggle_datasets:
             self.logger.info("Attempting Kaggle dataset loading")
             for dataset in self.kaggle_datasets:
                 try:
                     path = self.kaggle.mount_dataset(dataset)
-                    data = self._load_from_directory(path)
-                    raw_data.update(data)
+                    raw_data.update(self._load_from_directory(path))
                     self.logger.info(f"Loaded from Kaggle dataset: {dataset}")
                 except Exception as e:
                     self.logger.warning(f"Failed to load Kaggle dataset {dataset}: {e}")
-        
-        # Try local data directory
+
+        if not raw_data:
+            raw_data = self._load_from_oanda()
+
         if not raw_data:
             data_dir = self.project_root / "data" / "raw"
             if data_dir.exists():
                 raw_data = self._load_from_directory(data_dir)
-        
-        # Generate synthetic data as fallback for demo/testing
+                if raw_data:
+                    self.logger.info(f"Loaded {len(raw_data)} pairs from local files")
+
         if not raw_data:
-            self.logger.info("No external data found - generating synthetic forex data for testing")
-            raw_data = self._generate_synthetic_data()
-        
+            raw_data = self._load_from_yahoo()
+
+        if not raw_data:
+            if self.allow_synthetic:
+                self.logger.warning(
+                    "NO REAL MARKET DATA AVAILABLE - generating synthetic random-walk "
+                    "data. Signals and metrics from this run are NOT real."
+                )
+                raw_data = self._generate_synthetic_data()
+            else:
+                raise RuntimeError(
+                    "No market data available. Configure OANDA_API_KEY, place OHLCV "
+                    "files in data/raw/, or set allow_synthetic: true in the agent_a "
+                    "config to run in demo mode."
+                )
+
         return raw_data
+
+    def _pair_spread(self, pair: str) -> float:
+        for cfg in self.pairs_config:
+            if cfg.get("symbol") == pair:
+                return float(cfg.get("spread_avg", 0.0))
+        return 0.0
+
+    def _load_from_oanda(self) -> Dict[str, pd.DataFrame]:
+        """Fetch daily candles from OANDA when credentials are present."""
+        api_key = os.getenv("OANDA_API_KEY")
+        account_id = os.getenv("OANDA_ACCOUNT_ID")
+        if not api_key or not account_id:
+            return {}
+
+        from core.market_data import OandaProvider
+
+        environment = self.agent_config.get("environment", "practice")
+        provider = OandaProvider(api_key, account_id, environment=environment)
+        data: Dict[str, pd.DataFrame] = {}
+        for cfg in self.pairs_config:
+            pair = cfg["symbol"]
+            try:
+                data[pair] = provider.fetch(pair, spread=self._pair_spread(pair))
+                self.logger.info(f"  OANDA {pair}: {len(data[pair])} bars")
+            except Exception as e:
+                self.logger.warning(f"  OANDA {pair} failed: {e}")
+        return data
+
+    def _load_from_yahoo(self) -> Dict[str, pd.DataFrame]:
+        """Fetch real daily OHLCV from Yahoo Finance (no credentials required)."""
+        from core.market_data import YahooFinanceProvider
+
+        range_ = self.agent_config.get("yahoo_range", "10y")
+        provider = YahooFinanceProvider(range_=range_)
+        data: Dict[str, pd.DataFrame] = {}
+        for cfg in self.pairs_config:
+            pair = cfg["symbol"]
+            try:
+                df = provider.fetch(pair, spread=self._pair_spread(pair))
+                if len(df) < 500:
+                    self.logger.warning(f"  Yahoo {pair}: only {len(df)} bars, skipping")
+                    continue
+                data[pair] = df
+                self.logger.info(f"  Yahoo {pair}: {len(df)} bars "
+                                 f"({df.index[0].date()} -> {df.index[-1].date()})")
+            except Exception as e:
+                self.logger.warning(f"  Yahoo {pair} failed: {e}")
+        return data
 
     def _load_from_directory(self, path: Path) -> Dict[str, pd.DataFrame]:
         """Load all CSV/Parquet files from a directory"""
@@ -522,6 +593,15 @@ class DataIngestionEngine(BaseAgent):
         df["ema_ratio_12_26"] = close.ewm(span=12, adjust=False).mean() / close.ewm(span=26, adjust=False).mean()
         
         # Clean up NaN
+
+        # Lag derived features by one bar so a model predicting the direction of
+        # bar t+1 only ever observes information from fully settled bars <= t-1.
+        # Yahoo's synthesized FX daily bars overlap adjacent sessions (the next
+        # close falls inside today's range ~74% of the time), which leaks the
+        # target through any intra-bar feature and inflates CV accuracy to ~0.8.
+        protected = {"open", "high", "low", "close", "volume", "spread"}
+        derived = [c for c in df.columns if c not in protected]
+        df[derived] = df[derived].shift(1)
         df = df.dropna()
         
         return df
@@ -574,47 +654,32 @@ class DataIngestionEngine(BaseAgent):
         return result, len(selected)
 
     def _mrmr_selection(self, df: pd.DataFrame, features: List[str], n_select: int) -> List[str]:
-        """Minimum Redundancy Maximum Relevance feature selection"""
+        """Minimum Redundancy Maximum Relevance feature selection.
+
+        Uses a single precomputed absolute-correlation matrix so the greedy
+        loop is O(n_features * n_select) instead of recomputing pairwise
+        correlations on every iteration.
+        """
         target = "target_direction"
-        
-        # Calculate relevance (mutual information approximation using correlation)
-        relevance = {}
-        for f in features:
-            relevance[f] = abs(df[f].corr(df[target]))
-        
-        # Initialize with most relevant feature
-        selected = [max(relevance, key=relevance.get)]
-        remaining = set(features) - set(selected)
-        
-        # Iteratively add features
+        feat_df = df[features]
+        corr = feat_df.corr().abs().fillna(0.0)
+        relevance = feat_df.corrwith(df[target]).abs().fillna(0.0)
+
+        if relevance.empty:
+            return features[:n_select]
+
+        selected = [relevance.idxmax()]
+        remaining = [f for f in features if f not in selected]
+
         while len(selected) < n_select and remaining:
-            best_score = -np.inf
-            best_feature = None
-            
-            for f in remaining:
-                # Relevance term
-                rel = relevance[f]
-                
-                # Redundancy term (average correlation with selected features)
-                if selected:
-                    red = np.mean([abs(df[f].corr(df[s])) for s in selected])
-                else:
-                    red = 0
-                
-                # MRMR score
-                score = rel - red
-                
-                if score > best_score:
-                    best_score = score
-                    best_feature = f
-            
-            if best_feature:
-                selected.append(best_feature)
-                remaining.remove(best_feature)
-            else:
-                break
-        
+            redundancy = corr.loc[remaining, selected].mean(axis=1)
+            scores = relevance.loc[remaining] - redundancy
+            best = scores.idxmax()
+            selected.append(best)
+            remaining.remove(best)
+
         return selected
+
 
     def _mutual_info_selection(self, df: pd.DataFrame, features: List[str], n_select: int) -> List[str]:
         """Mutual information-based feature selection"""
@@ -641,9 +706,14 @@ class DataIngestionEngine(BaseAgent):
 
     def _save_feature_matrix(self, data: Dict[str, pd.DataFrame]) -> str:
         """Save feature matrices for all pairs"""
-        # Save individual pair features
+        # Save individual pair features (preserve the candle timestamp column so
+        # downstream agents can label signals with real market time).
         for pair, df in data.items():
-            self.save_artifact(df, f"{pair}_features.parquet", subdir="features")
+            out = df.reset_index()
+            first_col = out.columns[0]
+            if first_col not in ("timestamp", "datetime", "date") and pd.api.types.is_datetime64_any_dtype(out[first_col]):
+                out = out.rename(columns={first_col: "timestamp"})
+            self.save_artifact(out, f"{pair}_features.parquet", subdir="features")
         
         # Save combined metadata
         metadata = {

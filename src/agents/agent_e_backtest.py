@@ -10,6 +10,7 @@ drawdown decomposition, regime-dependent attribution.
 """
 
 import json
+import traceback
 import warnings
 from collections import defaultdict
 from datetime import datetime
@@ -59,6 +60,7 @@ class BacktestingEngine(BaseAgent):
         # Results storage
         self._backtest_results: Dict[str, Any] = {}
         self._equity_curves: Dict[str, pd.Series] = {}
+        self._periods_per_year = 252  # overwritten once the bar frequency is known
 
     def _execute_core(self) -> Dict[str, Any]:
         """Execute backtesting pipeline"""
@@ -105,7 +107,7 @@ class BacktestingEngine(BaseAgent):
                     results["monte_carlo_results"][pair] = mc_result
                 
             except Exception as e:
-                self.logger.error(f"  Backtest failed for {pair}: {e}")
+                self.logger.error(f"  Backtest failed for {pair}: {e}"); self.logger.error(traceback.format_exc())
                 continue
         
         # Step 3: Cross-pair portfolio analysis
@@ -139,11 +141,24 @@ class BacktestingEngine(BaseAgent):
         
         return data
 
+    def _set_annualization(self, df: pd.DataFrame) -> None:
+        """Derive bars-per-year from the data so Sharpe/annualised figures are
+        scaled to the actual sampling frequency (daily data here, not 5-min)."""
+        if "timestamp" in df.columns and len(df) > 1:
+            ts = pd.to_datetime(df["timestamp"])
+            days = (ts.iloc[-1] - ts.iloc[0]).days
+            if days > 0:
+                self._periods_per_year = max(1, int(round(len(df) / (days / 365.25))))
+                return
+        self._periods_per_year = 252
+
     def _walk_forward_backtest(self, pair: str, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Walk-forward optimization backtest.
         Train on in-sample, test on out-of-sample, then roll forward.
         """
+        self._set_annualization(df)
+
         if not self.wf_config.get("enabled", True):
             return self._simple_backtest(pair, df)
         
@@ -161,17 +176,25 @@ class BacktestingEngine(BaseAgent):
         # Generate features
         X, feature_cols = self._prepare_backtest_features(df)
         y = (df["close"].shift(-1) > df["close"]).astype(int).loc[X.index]
+        # Align returns to the feature index; otherwise fold slices are taken by
+        # position from a differently-sized series and late folds broadcast-fail.
+        returns = df["close"].pct_change().reindex(X.index).fillna(0.0)
         
         # Walk-forward folds
         folds = []
         all_returns = []
+        max_folds = self.wf_config.get("max_folds", 50)
         
         start_idx = 0
         fold_num = 0
         
-        while start_idx + min_train + step_size <= len(X):
+        while (start_idx + min_train + step_size <= len(X)
+               and fold_num < max_folds):
             fold_num += 1
-            train_end = start_idx + int(min_train * (1 + 0.2 * fold_num))
+            train_end = start_idx + min_train + (fold_num - 1) * step_size
+            train_end = min(train_end, len(X) - step_size)
+            if fold_num % 10 == 0:
+                self.logger.info(f"    {pair}: fold {fold_num}/{max_folds}")
             test_end = min(train_end + step_size, len(X))
             
             if test_end > len(X):
@@ -202,7 +225,7 @@ class BacktestingEngine(BaseAgent):
                     "train_end": str(X.index[train_end - 1]),
                     "test_start": str(X.index[train_end]),
                     "test_end": str(X.index[test_end - 1]),
-                    "n_trades": int(np.sum(pred_direction != 0.5)),
+                    "n_trades": int(np.sum(np.diff(pred_direction) != 0)),
                     "fold_return": float(np.sum(fold_returns)),
                     "fold_sharpe": float(self._calculate_sharpe(fold_returns))
                 }
@@ -255,7 +278,8 @@ class BacktestingEngine(BaseAgent):
 
     def _prepare_backtest_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         """Prepare features for backtest model"""
-        exclude = ["open", "high", "low", "close", "volume", "target"]
+        exclude = ["open", "high", "low", "close", "volume", "target",
+                   "timestamp", "datetime", "date", "spread"]
         feature_cols = [c for c in df.columns 
                        if c not in exclude and df[c].dtype in [np.float64, np.float32, np.int64]]
         
@@ -295,11 +319,11 @@ class BacktestingEngine(BaseAgent):
         
         # Basic returns
         total_return = (1 + returns).prod() - 1
-        n_years = len(returns) / (252 * 24 * 12) if len(returns) > 0 else 1  # 5-min data
+        n_years = len(returns) / self._periods_per_year if len(returns) > 0 else 1
         ann_return = (1 + total_return) ** (1 / max(n_years, 1e-6)) - 1
         
         # Risk metrics
-        ann_vol = returns.std() * np.sqrt(252)
+        ann_vol = returns.std() * np.sqrt(self._periods_per_year)
         
         # Sharpe Ratio
         if ann_vol > 0:
@@ -309,7 +333,7 @@ class BacktestingEngine(BaseAgent):
         
         # Sortino Ratio
         downside_returns = returns[returns < 0]
-        downside_vol = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else 1e-6
+        downside_vol = downside_returns.std() * np.sqrt(self._periods_per_year) if len(downside_returns) > 0 else 1e-6
         sortino = (ann_return - self.risk_free_rate) / downside_vol
         
         # Maximum Drawdown
@@ -414,18 +438,18 @@ class BacktestingEngine(BaseAgent):
             cumulative = (1 + sim_returns).cumprod()
             
             # Sharpe
-            ann_sharpe = sim_returns.mean() / sim_returns.std() * np.sqrt(252) if sim_returns.std() > 0 else 0
+            ann_sharpe = sim_returns.mean() / sim_returns.std() * np.sqrt(self._periods_per_year) if sim_returns.std() > 0 else 0
             
             # Max DD
             running_max = cumulative.cummax()
             dd = (cumulative - running_max) / running_max
             max_dd = dd.min()
             
-            mc_returns.append(cumulative[-1] - 1)
+            mc_returns.append(float(cumulative.iloc[-1]) - 1)
             mc_sharpes.append(ann_sharpe)
             mc_maxdds.append(max_dd)
         
-        actual_sharpe = returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 0
+        actual_sharpe = returns.mean() / returns.std() * np.sqrt(self._periods_per_year) if returns.std() > 0 else 0
         
         result = {
             "n_simulations": n_simulations,
@@ -462,7 +486,7 @@ class BacktestingEngine(BaseAgent):
         """Calculate annualized Sharpe ratio"""
         if returns.std() == 0:
             return 0.0
-        return float(returns.mean() / returns.std() * np.sqrt(252))
+        return float(returns.mean() / returns.std() * np.sqrt(self._periods_per_year))
 
     def _deflated_sharpe(self, sharpe: float, n_observations: int, 
                          n_trials: int) -> float:
